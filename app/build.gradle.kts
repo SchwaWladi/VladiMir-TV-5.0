@@ -11,7 +11,7 @@ android {
         applicationId = "com.vladimir.tv.v5"
         minSdk = 23
         targetSdk = 28
-        versionCode = 51
+        versionCode = 52
         versionName = "5.1.0"
     }
     compileOptions {
