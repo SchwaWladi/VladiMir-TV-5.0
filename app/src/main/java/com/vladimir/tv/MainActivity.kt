@@ -69,7 +69,14 @@ class MainActivity : Activity() {
     private var epgLoadGeneration = 0
     data class Programme(val channel: String, val start: Long, val stop: Long, val title: String, val description: String)
     private val epgSchedule = mutableMapOf<String, MutableList<Programme>>()
-    private val epgChannelNames = mutableMapOf<String, String>()
+    private var epgAliases = emptyMap<String, String>()
+    private var epgIcons = emptyMap<String, String>()
+    private val qualitySuffix = Regex("""(?i)(?:\s+(?:UHD|FHD|HD|SD|4K|BY|RU|DE))+$""")
+    private data class GuideFeed(
+        val programmes: Map<String, MutableList<Programme>>,
+        val names: Map<String, Set<String>>,
+        val icons: Map<String, String>
+    )
     private var playerFrame: FrameLayout? = null
     private var sidePanel: View? = null
     private var sidePanelBack: (() -> Unit)? = null
@@ -706,14 +713,28 @@ class MainActivity : Activity() {
 
         content.addView(list)
 
-        fun fill(group: String, mediaFilter: Int = 0) {
+        fun fill(group: String, mediaFilter: Int = 0, page: Int = 0) {
             val now = System.currentTimeMillis()
             list.removeAllViews()
 
-            val visible = orderedCandidates.filter { entry ->
+            val matching = orderedCandidates.filter { entry ->
                 (group.isEmpty() || entry.group == group) &&
                     (mediaFilter == 0 || isSeries(entry) == (mediaFilter == 2))
-            }.take(1500)
+            }
+            val pageSize = 100
+            val visible = matching.drop(page * pageSize).take(pageSize)
+            if (page > 0) list.addView(button(tr("Предыдущая страница", "Vorherige Seite", "Previous page")) {
+                fill(group, mediaFilter, page - 1)
+                list.getChildAt(0)?.requestFocus()
+            })
+            fun nextPage() {
+                if ((page + 1) * pageSize < matching.size) {
+                    list.addView(button(tr("Следующая страница", "Nächste Seite", "Next page")) {
+                        fill(group, mediaFilter, page + 1)
+                        list.getChildAt(0)?.requestFocus()
+                    })
+                }
+            }
             if (visible.isEmpty()) list.addView(label(tr("Нет записей", "Keine Einträge", "No entries")))
             val channelList = type == "tv" || type == "favorites"
             val mode = if (channelList) prefs.getInt("channel_layout", 0) else 0
@@ -724,7 +745,8 @@ class MainActivity : Activity() {
                 visible.chunked(columns).forEach { entries ->
                     val gridRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
                     entries.forEach { entry ->
-                        val validLogo = entry.logo.startsWith("http://") || entry.logo.startsWith("https://")
+                        val logo = channelLogo(entry)
+                        val validLogo = logo.isNotBlank()
                         val card = LinearLayout(this).apply {
                             orientation = LinearLayout.VERTICAL
                             gravity = Gravity.CENTER
@@ -746,7 +768,7 @@ class MainActivity : Activity() {
                             }
                         }
                         if (validLogo) card.addView(
-                            artwork(entry.logo, 120, if (logosOnly) 100 else 68),
+                            artwork(logo, 120, if (logosOnly) 100 else 68),
                             LinearLayout.LayoutParams(-1, dp(if (logosOnly) 100 else 68))
                         )
                         if (!logosOnly || !validLogo) {
@@ -777,6 +799,7 @@ class MainActivity : Activity() {
                     }
                     list.addView(gridRow)
                 }
+                nextPage()
                 return
             }
 
@@ -789,7 +812,7 @@ class MainActivity : Activity() {
                     if (prefs.getBoolean("show_artwork", true)) {
                         val logoWidth = when (mode) { 1 -> 144; 2 -> 52; else -> if (type == "movies") 116 else 108 }
                         val logoHeight = when (mode) { 1 -> 96; 2 -> 42; else -> if (type == "movies") 166 else 72 }
-                        row.addView(artwork(entry.logo, logoWidth, logoHeight))
+                        row.addView(artwork(channelLogo(entry), logoWidth, logoHeight))
                     }
                     val isMovie = entry.type == "movies"
                     val guide = if (isMovie || !showProgramme) "" else guideEntries(entry)
@@ -835,6 +858,7 @@ class MainActivity : Activity() {
 
                     list.addView(row)
                 }
+            nextPage()
         }
 
         fill("")
@@ -1053,7 +1077,7 @@ class MainActivity : Activity() {
 
                 connection.disconnect()
 
-                val parsed = parseM3u(body)
+                val parsed = parseM3u(body, url)
                 val guides = m3uGuideUrls(body, url)
 
                 runOnUiThread {
@@ -1062,11 +1086,10 @@ class MainActivity : Activity() {
                             playlistGuideUrls = guides
                             loadEpg()
                         }
-                        items.removeAll { it.url !in parsed.map { entry -> entry.url } && !it.url.contains("/live/") }
-                        parsed.forEach { entry ->
-                            val existing = items.indexOfFirst { it.url == entry.url }
-                            if (existing < 0) items.add(entry) else items[existing] = entry
-                        }
+                        val merged = items.filter { it.url.contains("/live/") }.associateByTo(linkedMapOf()) { it.url }
+                        parsed.forEach { merged[it.url] = it }
+                        items.clear()
+                        items.addAll(merged.values)
                         toast("${parsed.size} items")
                         if (current == "home") showHome()
                     }
@@ -1089,7 +1112,7 @@ class MainActivity : Activity() {
             }.filter { it.startsWith("http://") || it.startsWith("https://") }.distinct().toList()
     }
 
-    private fun parseM3u(raw: String): List<Entry> {
+    private fun parseM3u(raw: String, playlistUrl: String): List<Entry> {
         val result = ArrayList<Entry>()
 
         var title = ""
@@ -1100,27 +1123,31 @@ class MainActivity : Activity() {
         var catchup = ""
         var days = 0
 
-        val attributes = Regex(
-            "([\\w-]+)=\"([^\"]*)\""
-        )
+        val attributes = Regex("""([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,]+))""")
+        fun attributesIn(line: String) = attributes.findAll(line).associate {
+            it.groupValues[1].lowercase(Locale.ROOT) to it.groupValues.drop(2).firstOrNull(String::isNotEmpty).orEmpty()
+        }
+        val header = raw.lineSequence().firstOrNull { it.trim().trimStart('\uFEFF').startsWith("#EXTM3U", true) }.orEmpty()
+        val defaults = attributesIn(header)
 
-        for (line in raw.lineSequence().map { it.trim() }) {
+        for (line in raw.lineSequence().map { it.trim().trimStart('\uFEFF') }) {
             if (line.startsWith("#EXTINF", true)) {
-                val attrs = attributes.findAll(line)
-                    .associate {
-                        it.groupValues[1].lowercase(Locale.ROOT) to it.groupValues[2]
-                    }
-
-                title = line.substringAfterLast(
-                    ',',
-                    attrs["tvg-name"] ?: "Stream"
-                ).trim()
+                val attrs = defaults + attributesIn(line)
+                var quote: Char? = null
+                val separator = line.indices.firstOrNull { i ->
+                    val char = line[i]
+                    if (char == quote) quote = null
+                    else if (quote == null && (char == '"' || char.code == 39)) quote = char
+                    char == ',' && quote == null
+                }
+                title = separator?.let { line.substring(it + 1).trim() } ?: attrs["tvg-name"].orEmpty()
 
                 group = attrs["group-title"] ?: "Other"
-                logo = attrs["tvg-logo"] ?: ""
+                logo = webUrl(playlistUrl, attrs["tvg-logo"].orEmpty()).orEmpty()
                 epgId = attrs["tvg-id"]?.takeIf { it.isNotBlank() } ?: attrs["tvg-name"].orEmpty()
-                catchup = attrs["catchup-source"].orEmpty()
-                days = (attrs["catchup-days"] ?: attrs["tvg-rec"])?.toIntOrNull()?.coerceIn(0, 30) ?: 0
+                val source = attrs["catchup-source"].orEmpty()
+                catchup = if (attrs["catchup"].equals("append", true) && source.isNotBlank()) "@append:" + source else source
+                days = (attrs["catchup-days"] ?: attrs["tvg-rec"] ?: attrs["timeshift"])?.toIntOrNull()?.coerceIn(0, 30) ?: 0
                 description = sequenceOf("plot", "description", "tvg-description")
                     .mapNotNull(attrs::get).firstOrNull { it.isNotBlank() }.orEmpty()
 
@@ -1393,28 +1420,25 @@ class MainActivity : Activity() {
     }
 
     private fun guideEntries(entry: Entry): List<Programme> {
-        val id = entry.epgId
-        val byId = epgSchedule[id] ?: epgSchedule.entries.firstOrNull { id.isNotBlank() && it.key.equals(id, true) }?.value
-        if (!byId.isNullOrEmpty()) return byId.sortedBy { it.start }
-        fun normalized(value: String) = value.lowercase(Locale.ROOT).filter { it.isLetterOrDigit() }
-        val idKey = normalized(id)
-        if (idKey.isNotEmpty()) {
-            val idMatch = epgSchedule.keys.singleOrNull { normalized(it) == idKey }
-            if (idMatch != null) return epgSchedule[idMatch].orEmpty()
-        }
-        val titleKey = normalized(entry.title)
-        val match = epgChannelNames.entries.singleOrNull {
-            titleKey.isNotEmpty() && it.key in epgSchedule && normalized(it.value) == titleKey
-        }
-        if (match != null) return epgSchedule[match.key].orEmpty()
-        fun withoutQuality(value: String) = normalized(value.trim()
-            .replace(Regex("""(?i)(?:\s+(?:UHD|FHD|HD|SD|4K|BY|RU|DE))+$"""), ""))
-        val alias = withoutQuality(entry.title)
-        val aliasMatch = epgChannelNames.entries.singleOrNull {
-            alias.isNotEmpty() && it.key in epgSchedule && withoutQuality(it.value) == alias
-        }
-        return epgSchedule[aliasMatch?.key].orEmpty()
+        return epgSchedule[guideChannelId(entry)].orEmpty()
     }
+
+    private fun normalizedGuideName(value: String) =
+        value.lowercase(Locale.ROOT).filter { it.isLetterOrDigit() }
+
+    private fun guideChannelId(entry: Entry): String? =
+        entry.epgId.takeIf { it in epgSchedule || it in epgIcons }
+            ?: sequenceOf(entry.epgId, entry.title, entry.title.trim().replace(qualitySuffix, ""))
+                .mapNotNull { epgAliases[normalizedGuideName(it)] }.firstOrNull()
+
+    private fun webUrl(base: String, value: String): String? {
+        if (value.isBlank()) return null
+        return runCatching { URL(URL(base), value.trim()).toString() }.getOrNull()
+            ?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
+    }
+
+    private fun channelLogo(entry: Entry): String =
+        entry.logo.ifBlank { if (entry.type == "tv") epgIcons[guideChannelId(entry)].orEmpty() else "" }
 
     private fun archiveUrl(entry: Entry, programme: Programme, playbackTime: Long): String? {
         val durationMinutes = ((programme.stop - programme.start + 59999) / 60000)
@@ -1425,12 +1449,16 @@ class MainActivity : Activity() {
             val stop = programme.stop / 1000L
             return when {
                 template.isNotBlank() -> runCatching {
-                    val resolved = template.replace("{utc}", start.toString())
+                    val resolved = template.removePrefix("@append:").replace("{utc}", start.toString())
+                        .replace("${'$'}{start}", start.toString())
+                        .replace("${'$'}{end}", stop.toString())
+                        .replace("${'$'}{duration}", (stop - start).toString())
                         .replace("{utcend}", stop.toString())
                         .replace("{start}", start.toString())
                         .replace("{end}", stop.toString())
                         .replace("{duration}", (stop - start).toString())
-                    URL(URL(entry.url), resolved).toString().takeIf {
+                    val address = if (template.startsWith("@append:")) entry.url + resolved else URL(URL(entry.url), resolved).toString()
+                    address.takeIf {
                         !it.contains('{') && (it.startsWith("https://") || it.startsWith("http://"))
                     }
                 }.getOrNull()
@@ -1511,7 +1539,7 @@ class MainActivity : Activity() {
                 conn.readTimeout = 30000
                 val raw = conn.inputStream.bufferedReader().use { it.readText() }
                 conn.disconnect()
-                val parsed = parseM3u(raw).map { it.copy(type = "movies") }
+                val parsed = parseM3u(raw, address).map { it.copy(type = "movies") }
                 runOnUiThread {
                     vodItems.removeAll { it.url !in parsed.map { entry -> entry.url } && !it.url.contains("/movie/") }
                     vodItems.addAll(parsed.filter { entry -> vodItems.none { it.url == entry.url } })
@@ -2001,44 +2029,56 @@ class MainActivity : Activity() {
         val provider = if (server.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
             "$server/xmltv.php?username=${URLEncoder.encode(user, "UTF-8")}&password=${URLEncoder.encode(pass, "UTF-8")}"
         } else ""
-        val addresses = (listOf(manual, provider, "http://epg.uspeh.my/epg.xml.gz") + playlistGuideUrls.take(4) + listOf(
+        val addresses = (listOf(manual, provider) + playlistGuideUrls.take(4) + listOf(
+            "https://epg.admuspeh.my/epg.xml.gz",
             "https://free-epg.de/api/epg/de.xml.gz",
             "https://free-epg.de/api/epg/ru.xml.gz"
         )).filter { it.startsWith("http://") || it.startsWith("https://") }.distinct()
         val now = System.currentTimeMillis()
         thread {
             val schedule = mutableMapOf<String, MutableList<Programme>>()
-            val names = mutableMapOf<String, String>()
+            val names = mutableMapOf<String, MutableSet<String>>()
+            val icons = mutableMapOf<String, String>()
             addresses.forEach { address ->
                 val feed = runCatching { readGuide(address, now) }.getOrNull()
                 if (feed != null) {
-                    feed.first.forEach { (id, entries) -> schedule.getOrPut(id) { mutableListOf() }.addAll(entries) }
-                    feed.second.forEach { (id, name) -> if (id !in names) names[id] = name }
+                    feed.programmes.forEach { (id, entries) -> schedule.getOrPut(id) { mutableListOf() }.addAll(entries) }
+                    feed.names.forEach { (id, aliases) -> names.getOrPut(id) { mutableSetOf() }.addAll(aliases) }
+                    feed.icons.forEach { (id, icon) -> icons.putIfAbsent(id, icon) }
                 }
+            }
+            val aliases = mutableMapOf<String, MutableSet<String>>()
+            (schedule.keys + icons.keys).forEach { id ->
+                (names[id].orEmpty() + id).forEach { name ->
+                    val key = normalizedGuideName(name)
+                    if (key.isNotEmpty()) aliases.getOrPut(key) { mutableSetOf() }.add(id)
+                }
+            }
+            val uniqueAliases = aliases.mapNotNull { (key, ids) -> ids.singleOrNull()?.let { key to it } }.toMap()
+            val sorted = schedule.mapValues { (_, entries) ->
+                entries.distinctBy { it.start }.sortedBy { it.start }.toMutableList()
             }
             runOnUiThread {
                 if (generation != epgLoadGeneration || isDestroyed) return@runOnUiThread
-                if (schedule.isNotEmpty()) {
+                if (sorted.isNotEmpty() || icons.isNotEmpty()) {
                     epgSchedule.clear()
-                    schedule.forEach { (id, entries) ->
-                        epgSchedule[id] = entries.distinctBy { it.start }.sortedBy { it.start }.toMutableList()
-                    }
-                    epgChannelNames.clear()
-                    epgChannelNames.putAll(names)
+                    epgSchedule.putAll(sorted)
+                    epgAliases = uniqueAliases
+                    epgIcons = icons
                     if (current in setOf("tv", "favorites", "guide")) showCatalog(current, catalogGroup)
-                } else {
-                    toast(tr("EPG: нет данных", "EPG: keine Daten", "EPG: no data"))
                 }
+                if (sorted.isEmpty()) toast(tr("EPG: нет данных", "EPG: keine Daten", "EPG: no data"))
             }
         }
     }
 
-    private fun readGuide(address: String, now: Long): Pair<Map<String, MutableList<Programme>>, Map<String, String>> {
+    private fun readGuide(address: String, now: Long): GuideFeed {
         val connection = URL(address).openConnection() as HttpURLConnection
         connection.connectTimeout = 12000
         connection.readTimeout = 30000
         val schedule = mutableMapOf<String, MutableList<Programme>>()
-        val names = mutableMapOf<String, String>()
+        val names = mutableMapOf<String, MutableSet<String>>()
+        val icons = mutableMapOf<String, String>()
         val timeFormat = SimpleDateFormat("yyyyMMddHHmmss Z", Locale.US).apply { isLenient = false }
         fun time(value: String?): Long {
             val parts = value.orEmpty().trim().split(Regex("\\s+"), limit = 2)
@@ -2069,8 +2109,13 @@ class MainActivity : Activity() {
                                 "channel" -> id = xml.getAttributeValue(null, "id").orEmpty()
                                 "display-name" -> {
                                     val name = xml.nextText().trim()
-                                    if (id.isNotBlank() && name.isNotBlank() && id !in names) names[id] = name
+                                    if (id.isNotBlank() && name.isNotBlank()) names.getOrPut(id) { mutableSetOf() }.add(name)
                                 }
+                                "icon" -> if (id.isNotBlank()) {
+                                    webUrl(connection.url.toString(), xml.getAttributeValue(null, "src").orEmpty())
+                                        ?.let { icons.putIfAbsent(id, it) }
+                                    Unit
+                                } else Unit
                                 "programme" -> {
                                     channel = xml.getAttributeValue(null, "channel").orEmpty()
                                     start = time(xml.getAttributeValue(null, "start"))
@@ -2098,7 +2143,7 @@ class MainActivity : Activity() {
                 }
             }
         } finally { connection.disconnect() }
-        return schedule to names
+        return GuideFeed(schedule, names, icons)
     }
 
     private fun localIp(): String? {
